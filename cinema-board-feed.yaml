@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------------------
+# Easy Cinema Board feed (Radarr -> Home Assistant)
+#
+# Creates sensor.cinema_board_feed with three lists the card shows:
+#   available - 50 random movies you have (a fresh mix every refresh)
+#   recent    - your 12 newest movies (Just Added)
+#   coming    - monitored movies you don't have yet, next 180 days (Coming Soon)
+# Posters are public TMDB links, so no API key or token ever reaches your dashboard.
+#
+# SETUP
+# 1) secrets.yaml - add your Radarr API key (Radarr > Settings > General > API Key):
+#      radarr_api_key: PASTE_YOUR_RADARR_API_KEY_HERE
+#
+# 2) Change RADARR_HOST:7878 below (both URLs) to your Radarr address,
+#    for example 192.168.1.50:7878.
+#
+# 3) Add this file to Home Assistant, EITHER:
+#    a) As a package: put it in /config/packages/ and make sure configuration.yaml has
+#         homeassistant:
+#           packages: !include_dir_named packages
+#    OR
+#    b) Paste it into configuration.yaml. If you already have a "rest_command:" or
+#       "template:" section, put these entries UNDER your existing section instead of
+#       adding a second "rest_command:" or "template:" line.
+#
+# 4) Developer Tools (Tools) > YAML > Check configuration, then restart Home Assistant.
+#    To refresh on demand later: Developer Tools > Events > fire "cinema_board_refresh".
+# ---------------------------------------------------------------------------
+
+rest_command:
+  radarr_movies:
+    url: "http://RADARR_HOST:7878/api/v3/movie"
+    method: get
+    headers:
+      X-Api-Key: !secret radarr_api_key
+    timeout: 60
+  radarr_calendar:
+    url: "http://RADARR_HOST:7878/api/v3/calendar?start={{ start }}&end={{ end }}"
+    method: get
+    headers:
+      X-Api-Key: !secret radarr_api_key
+    timeout: 30
+
+template:
+  - triggers:
+      - trigger: time_pattern
+        hours: "/2"
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: cinema_board_refresh
+    actions:
+      - action: rest_command.radarr_movies
+        response_variable: lib
+        continue_on_error: true
+      - action: rest_command.radarr_calendar
+        data:
+          start: "{{ now().strftime('%Y-%m-%d') }}"
+          end: "{{ (now() + timedelta(days=180)).strftime('%Y-%m-%d') }}"
+        response_variable: cal
+        continue_on_error: true
+    sensor:
+      - name: Cinema Board Feed
+        unique_id: cinema_board_feed
+        icon: mdi:filmstrip-box-multiple
+        device_class: timestamp
+        state: "{{ now().isoformat() }}"
+        attributes:
+          # 50 random movies you have (Now Available)
+          available: >-
+            {%- set ns = namespace(pool=[], out=[], seen=[]) -%}
+            {%- if lib is defined and lib.status == 200 -%}
+            {%- for m in lib.content if m.hasFile -%}
+            {%- set p = (m.images | default([]) | selectattr('coverType','eq','poster') | selectattr('remoteUrl','defined') | map(attribute='remoteUrl') | list + [''])[0] -%}
+            {%- if p -%}{%- set ns.pool = ns.pool + [{'t': m.title, 'y': m.year, 'p': p | replace('/original/','/w780/')}] -%}{%- endif -%}
+            {%- endfor -%}
+            {%- for i in range(90) if ns.pool and ns.out | count < 50 -%}{%- set c = ns.pool | random -%}{%- if c.t not in ns.seen -%}{%- set ns.seen = ns.seen + [c.t] -%}{%- set ns.out = ns.out + [c] -%}{%- endif -%}{%- endfor -%}
+            {{ ns.out }}
+            {%- else -%}{{ this.attributes.available | default([]) }}{%- endif -%}
+          # 12 newest movies added (Just Added)
+          recent: >-
+            {%- set ns = namespace(rec=[]) -%}
+            {%- if lib is defined and lib.status == 200 -%}
+            {%- for m in lib.content | selectattr('hasFile') | selectattr('movieFile','defined') | sort(attribute='movieFile.dateAdded', reverse=true) -%}
+            {%- if ns.rec | count < 12 -%}{%- set p = (m.images | default([]) | selectattr('coverType','eq','poster') | selectattr('remoteUrl','defined') | map(attribute='remoteUrl') | list + [''])[0] -%}{%- if p -%}{%- set ns.rec = ns.rec + [{'t': m.title, 'y': m.year, 'p': p | replace('/original/','/w780/'), 'a': m.movieFile.dateAdded[:10]}] -%}{%- endif -%}{%- endif -%}
+            {%- endfor -%}
+            {{ ns.rec }}
+            {%- else -%}{{ this.attributes.recent | default([]) }}{%- endif -%}
+          # Monitored movies you don't have yet, next 180 days (Coming Soon)
+          coming: >-
+            {%- set ns = namespace(com=[]) -%}
+            {%- if cal is defined and cal.status == 200 -%}
+            {%- for m in cal.content if not m.hasFile -%}
+            {%- set p = (m.images | default([]) | selectattr('coverType','eq','poster') | selectattr('remoteUrl','defined') | map(attribute='remoteUrl') | list + [''])[0] -%}
+            {%- if p -%}{%- set ns.com = ns.com + [{'t': m.title, 'y': m.year, 'p': p | replace('/original/','/w780/'), 'c': (m.inCinemas | default(''))[:10], 'd': (m.digitalRelease | default(''))[:10], 'h': (m.physicalRelease | default(''))[:10]}] -%}{%- endif -%}
+            {%- endfor -%}
+            {{ ns.com }}
+            {%- else -%}{{ this.attributes.coming | default([]) }}{%- endif -%}
